@@ -24,13 +24,62 @@ def test_bounded_episode_defaults_are_safe_and_opt_in():
         "max_episodes": 5,
         "max_total_iterations": 200,
         "max_wall_seconds": 7200,
+        "session_allowlist": None,
     }
-    assert episode_controller_from_config(config) is None
+    assert episode_controller_from_config(config, session_id="session-1") is None
 
-    enabled = episode_controller_from_config({**config, "enabled": True})
+    enabled = episode_controller_from_config(
+        {**config, "enabled": True}, session_id="session-1"
+    )
     assert enabled is not None
     assert enabled.checkpoint_interval == 20
     assert enabled.rollover_interval == 40
+
+
+def test_bounded_episode_session_allowlist_is_exact_and_fail_closed():
+    config = {
+        **DEFAULT_CONFIG["bounded_episodes"],
+        "enabled": True,
+        "session_allowlist": ["session-canary"],
+    }
+
+    assert (
+        episode_controller_from_config(config, session_id="session-canary")
+        is not None
+    )
+    assert episode_controller_from_config(config, session_id="session-other") is None
+    assert episode_controller_from_config(config, session_id=None) is None
+
+
+@pytest.mark.parametrize(
+    "allowlist",
+    ["session-canary", ["session-canary", 42], {"session-canary"}],
+)
+def test_bounded_episode_session_allowlist_rejects_malformed_values(allowlist):
+    config = {
+        **DEFAULT_CONFIG["bounded_episodes"],
+        "enabled": True,
+        "session_allowlist": allowlist,
+    }
+
+    with pytest.raises(ValueError, match="session_allowlist"):
+        episode_controller_from_config(config, session_id="session-canary")
+
+
+def test_turn_controller_applies_session_allowlist():
+    class Agent:
+        _session_db = object()
+        session_id = "session-canary"
+
+    config = {
+        **DEFAULT_CONFIG["bounded_episodes"],
+        "enabled": True,
+        "session_allowlist": ["session-canary"],
+    }
+
+    assert _episode_controller_for_turn(Agent(), config) is not None
+    Agent.session_id = "session-other"
+    assert _episode_controller_for_turn(Agent(), config) is None
 
 
 def test_turn_controller_requires_opt_in_and_durable_session_store():
@@ -150,6 +199,71 @@ def test_mechanical_checkpoint_uses_todos_and_verified_artifact_references(
     ]
     assert checkpoint.episode_iterations == 20
     assert checkpoint.total_iterations == 20
+
+
+def test_mechanical_checkpoint_carries_deduplicated_tool_execution_ledger():
+    class SessionDB:
+        latest = None
+
+        def load_latest_task_checkpoint(self, session_id, task_id):
+            assert session_id == "session-1"
+            assert task_id == "task-1"
+            return self.latest
+
+    class Agent:
+        _todo_store = None
+        _session_db = SessionDB()
+        session_id = "session-1"
+
+    controller = EpisodeController(clock=lambda: 100.0)
+    messages = [
+        {
+            "role": "tool",
+            "tool_name": "terminal",
+            "tool_call_id": "call-1",
+            "content": "SESSION-GATE-1 secret raw result",
+        },
+        {
+            "role": "tool",
+            "tool_name": "terminal",
+            "tool_call_id": "call-2",
+            "content": "SESSION-GATE-2 secret raw result",
+        },
+    ]
+
+    first = build_mechanical_checkpoint(
+        agent=Agent(),
+        controller=controller,
+        objective="Run two calls",
+        messages=messages,
+        task_id="task-1",
+    )
+    tool_steps = [step for step in first.completed_steps if step.startswith("[tool]")]
+    assert len(tool_steps) == 2
+    assert all("terminal result recorded" in step for step in tool_steps)
+    assert "SESSION-GATE" not in json.dumps(first.to_dict())
+
+    Agent._session_db.latest = first.to_dict()
+    second = build_mechanical_checkpoint(
+        agent=Agent(),
+        controller=controller,
+        objective="Run three calls",
+        messages=messages
+        + [
+            {
+                "role": "tool",
+                "tool_name": "terminal",
+                "tool_call_id": "call-3",
+                "content": "SESSION-GATE-3 secret raw result",
+            }
+        ],
+        task_id="task-1",
+    )
+    cumulative_tool_steps = [
+        step for step in second.completed_steps if step.startswith("[tool]")
+    ]
+    assert len(cumulative_tool_steps) == 3
+    assert len(set(cumulative_tool_steps)) == 3
 
 
 def test_mechanical_checkpoint_redacts_secrets_and_stays_bounded():

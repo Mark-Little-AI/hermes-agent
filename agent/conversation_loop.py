@@ -94,7 +94,9 @@ def _episode_controller_for_turn(agent, config=None):
             logger.warning("Could not load bounded episode config: %s", exc)
             return None
     try:
-        return episode_controller_from_config(config)
+        return episode_controller_from_config(
+            config, session_id=getattr(agent, "session_id", None)
+        )
     except (TypeError, ValueError) as exc:
         logger.warning("Invalid bounded episode config; feature disabled: %s", exc)
         return None

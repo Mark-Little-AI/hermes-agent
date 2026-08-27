@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import time
@@ -92,11 +93,22 @@ class EpisodeController:
 
 def episode_controller_from_config(
     config: dict[str, Any] | None,
+    *,
+    session_id: str | None = None,
 ) -> EpisodeController | None:
     """Construct an opt-in controller from the merged profile config."""
     config = config or {}
     if not config.get("enabled", False):
         return None
+    session_allowlist = config.get("session_allowlist")
+    if session_allowlist is not None:
+        if not isinstance(session_allowlist, list) or any(
+            not isinstance(value, str) or not value
+            for value in session_allowlist
+        ):
+            raise ValueError("session_allowlist must be null or a list of non-empty strings")
+        if session_id is None or session_id not in session_allowlist:
+            return None
     return EpisodeController(
         checkpoint_interval=int(config.get("checkpoint_interval", 20)),
         rollover_interval=int(config.get("rollover_interval", 40)),
@@ -112,6 +124,7 @@ def build_mechanical_checkpoint(
     controller: EpisodeController,
     objective: str,
     messages: Sequence[dict[str, Any]],
+    task_id: str | None = None,
 ) -> TaskCheckpoint:
     """Build bounded continuation state from deterministic runtime sources."""
     todos: Sequence[dict[str, Any]] = []
@@ -141,6 +154,41 @@ def build_mechanical_checkpoint(
         for item in todos[:32]
         if item.get("status") in {"in_progress", "pending"}
     ]
+
+    # Carry forward the prior checkpoint's bounded mechanical ledger, then add
+    # tool results from this active episode. Arguments and result content are
+    # deliberately excluded. A digest of the provider-generated call ID gives
+    # stable deduplication without carrying raw inputs across rollover.
+    prior_completed: list[str] = []
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    checkpoint_loader = getattr(session_db, "load_latest_task_checkpoint", None)
+    if task_id and callable(checkpoint_loader) and session_id:
+        prior = checkpoint_loader(session_id, task_id)
+        if prior is not None:
+            stored_steps = prior.get("completed_steps", [])
+            if not isinstance(stored_steps, list) or any(
+                not isinstance(step, str) for step in stored_steps
+            ):
+                raise ValueError("stored checkpoint contains invalid completed_steps")
+            prior_completed = stored_steps[:64]
+
+    tool_steps: list[str] = []
+    for message in messages[-64:]:
+        if message.get("role") != "tool":
+            continue
+        call_id = message.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        call_digest = hashlib.sha256(call_id.encode("utf-8")).hexdigest()[:12]
+        tool_name = _safe_text(message.get("tool_name") or "unknown", 128)
+        tool_steps.append(f"[tool] {call_digest} {tool_name} result recorded")
+
+    cumulative_completed: list[str] = []
+    for step in [*prior_completed, *completed, *tool_steps]:
+        if step and step not in cumulative_completed:
+            cumulative_completed.append(step)
+    cumulative_completed = cumulative_completed[-64:]
 
     verified_artifacts: list[dict[str, str]] = []
     seen_artifacts: set[str] = set()
@@ -201,7 +249,7 @@ def build_mechanical_checkpoint(
         objective=_safe_text(objective, 4_000),
         success_criteria=[],
         constraints=[],
-        completed_steps=completed,
+        completed_steps=cumulative_completed,
         verified_artifacts=verified_artifacts,
         decisions=continuation_notes,
         failed_approaches=failed,
@@ -387,6 +435,7 @@ def apply_episode_boundary(
         controller=controller,
         objective=objective,
         messages=checkpoint_messages,
+        task_id=task_id,
     )
     if action in {EpisodeAction.ROLLOVER, EpisodeAction.STOP}:
         agent._flush_messages_to_session_db(messages)

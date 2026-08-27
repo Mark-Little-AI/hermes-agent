@@ -1412,6 +1412,9 @@ DEFAULT_CONFIG = {
     "bounded_episodes": {
         # Opt-in until isolated gateway tests and a controlled pilot pass.
         "enabled": False,
+        # ``None`` enables every durable session once the feature is opted in.
+        # Set an exact list of session IDs for a fail-closed canary.
+        "session_allowlist": None,
         "checkpoint_interval": 20,
         "rollover_interval": 40,
         "max_episodes": 5,
