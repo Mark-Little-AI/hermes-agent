@@ -29,6 +29,7 @@ import re
 import shlex
 import uuid
 
+from tools.artifact_store import ArtifactRecord, FilesystemArtifactStore
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
@@ -121,6 +122,7 @@ def _build_persisted_message(
     has_more: bool,
     original_size: int,
     file_path: str,
+    artifact: ArtifactRecord | None = None,
 ) -> str:
     """Build the <persisted-output> replacement block."""
     size_kb = original_size / 1024
@@ -131,8 +133,16 @@ def _build_persisted_message(
 
     msg = f"{PERSISTED_OUTPUT_TAG}\n"
     msg += f"This tool result was too large ({original_size:,} characters, {size_str}).\n"
-    msg += f"Full output saved to: {file_path}\n"
-    msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
+    if artifact is not None:
+        msg += f"Artifact ID: {artifact.artifact_id}\n"
+        msg += f"SHA-256: {artifact.sha256}\n"
+        msg += (
+            "Use artifact_get with this artifact ID, offset, and limit to retrieve verified "
+            "sections. Do not read the underlying storage path directly.\n\n"
+        )
+    else:
+        msg += f"Full output saved to: {file_path}\n"
+        msg += "Use the read_file tool with offset and limit to access specific sections of this output.\n\n"
     msg += f"Preview (first {len(preview)} chars):\n"
     msg += preview
     if has_more:
@@ -148,12 +158,15 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    session_id: str | None = None,
+    artifact_store: FilesystemArtifactStore | None = None,
 ) -> str:
-    """Layer 2: persist oversized result into the sandbox, return preview + path.
+    """Layer 2: persist oversized output durably and return a bounded pointer.
 
-    Writes via env.execute() so the file is accessible from any backend
-    (local, Docker, SSH, Modal, Daytona). Falls back to inline truncation
-    if write fails or no env is available.
+    The canonical copy is stored in the active Hermes profile and retrieved by
+    artifact ID through ``artifact_get``, which verifies content integrity before
+    returning a bounded section. Backend mirror files are deliberately not created:
+    they bypass the profile quota and cannot be verified safely.
 
     Args:
         content: Raw tool result string.
@@ -174,20 +187,31 @@ def maybe_persist_tool_result(
     if len(content) <= effective_threshold:
         return content
 
-    storage_dir = _resolve_storage_dir(env)
-    remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 
-    if env is not None:
-        try:
-            if _write_to_sandbox(content, remote_path, env):
-                logger.info(
-                    "Persisted large tool result: %s (%s, %d chars -> %s)",
-                    tool_name, tool_use_id, len(content), remote_path,
-                )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
-        except Exception as exc:
-            logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
+    artifact = None
+    try:
+        artifact = (artifact_store or FilesystemArtifactStore()).put_text(
+            content,
+            tool_name=tool_name,
+            tool_call_id=tool_use_id,
+            session_id=session_id,
+        )
+    except Exception as exc:
+        logger.warning("Durable artifact write failed for %s: %s", tool_use_id, exc)
+
+    if artifact is not None:
+        logger.info(
+            "Persisted durable tool artifact: %s (%s, %d chars -> %s)",
+            tool_name, artifact.artifact_id, len(content), artifact.content_path,
+        )
+        return _build_persisted_message(
+            preview,
+            has_more,
+            len(content),
+            artifact.content_path,
+            artifact=artifact,
+        )
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
@@ -196,7 +220,7 @@ def maybe_persist_tool_result(
     return (
         f"{preview}\n\n"
         f"[Truncated: tool response was {len(content):,} chars. "
-        f"Full output could not be saved to sandbox.]"
+        f"Full output could not be saved to the durable artifact store.]"
     )
 
 
@@ -204,11 +228,12 @@ def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
+    session_id: str | None = None,
 ) -> list[dict]:
     """Layer 3: enforce aggregate budget across all tool results in a turn.
 
     If total chars exceed budget, persist the largest non-persisted results
-    first (via sandbox write) until under budget. Already-persisted results
+    first (via the quota-controlled artifact store) until under budget. Already-persisted results
     are skipped.
 
     Mutates the list in-place and returns it.
@@ -241,6 +266,7 @@ def enforce_turn_budget(
             env=env,
             config=config,
             threshold=0,
+            session_id=session_id,
         )
         if replacement != content:
             total_size -= size

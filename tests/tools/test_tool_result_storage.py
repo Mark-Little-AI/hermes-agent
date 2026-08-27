@@ -1,8 +1,12 @@
 """Tests for tools/tool_result_storage.py -- 3-layer tool result persistence."""
 
-import pytest
+import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from tools.artifact_store import FilesystemArtifactStore
 from tools.budget_config import (
     DEFAULT_RESULT_SIZE_CHARS,
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -232,9 +236,11 @@ class TestMaybePersistToolResult:
         )
         assert result == content
 
-    def test_above_threshold_with_env_persists(self):
+    def test_above_threshold_with_env_uses_durable_store_not_backend_copy(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
         content = "x" * 60_000
         result = maybe_persist_tool_result(
             content=content,
@@ -244,15 +250,16 @@ class TestMaybePersistToolResult:
             threshold=30_000,
         )
         assert PERSISTED_OUTPUT_TAG in result
-        assert "tc_456.txt" in result
+        assert "Artifact ID: artifact_" in result
+        assert "artifact_get" in result
+        assert "read_file" not in result
         assert len(result) < len(content)
-        env.execute.assert_called_once()
+        env.execute.assert_not_called()
 
-    def test_persists_full_content_as_is(self):
-        """Content is persisted verbatim — no JSON extraction."""
-        import json
+    def test_persists_full_content_as_is(self, tmp_path, monkeypatch):
+        """Content is stored verbatim in the quota-controlled artifact store."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
         raw = "line1\nline2\n" * 5_000
         content = json.dumps({"output": raw, "exit_code": 0, "error": None})
         result = maybe_persist_tool_result(
@@ -263,49 +270,55 @@ class TestMaybePersistToolResult:
             threshold=30_000,
         )
         assert PERSISTED_OUTPUT_TAG in result
-        # Content is delivered through stdin (no longer embedded in the
-        # command string — see test_large_content_via_stdin for why).
-        assert env.execute.call_args[1]["stdin_data"] == content
+        artifact_files = list((tmp_path / "profile" / "artifacts").rglob("content.txt"))
+        assert len(artifact_files) == 1
+        assert artifact_files[0].read_text(encoding="utf-8") == content
+        env.execute.assert_not_called()
 
-    def test_above_threshold_no_env_truncates_inline(self):
+    def test_above_threshold_without_env_uses_durable_artifact_store(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         content = "x" * 60_000
+
         result = maybe_persist_tool_result(
             content=content,
             tool_name="terminal",
             tool_use_id="tc_789",
             env=None,
             threshold=30_000,
+            session_id="session_123",
         )
-        assert PERSISTED_OUTPUT_TAG not in result
-        assert "Truncated" in result
-        assert len(result) < len(content)
 
-    def test_env_write_failure_falls_back_to_truncation(self):
+        assert PERSISTED_OUTPUT_TAG in result
+        assert "Artifact ID: artifact_" in result
+        assert "artifact_get" in result
+        assert "read_file" not in result
+        artifact_files = list((tmp_path / "profile" / "artifacts").rglob("content.txt"))
+        assert len(artifact_files) == 1
+        assert artifact_files[0].read_text(encoding="utf-8") == content
+        assert len(result) < 3_000
+
+    def test_artifact_quota_failure_truncates_without_backend_write(self, tmp_path):
         env = MagicMock()
-        env.execute.return_value = {"output": "disk full", "returncode": 1}
         content = "x" * 60_000
+        store = FilesystemArtifactStore(
+            root=tmp_path / "artifacts",
+            max_artifact_bytes=10,
+            quota_bytes=1_000,
+            min_free_bytes=0,
+        )
         result = maybe_persist_tool_result(
             content=content,
             tool_name="terminal",
             tool_use_id="tc_fail",
             env=env,
             threshold=30_000,
+            artifact_store=store,
         )
-        assert PERSISTED_OUTPUT_TAG not in result
-        assert "Truncated" in result
-
-    def test_env_execute_exception_falls_back(self):
-        env = MagicMock()
-        env.execute.side_effect = RuntimeError("connection lost")
-        content = "x" * 60_000
-        result = maybe_persist_tool_result(
-            content=content,
-            tool_name="terminal",
-            tool_use_id="tc_exc",
-            env=env,
-            threshold=30_000,
-        )
-        assert "Truncated" in result
+        assert "[Truncated:" in result
+        assert "durable artifact store" in result
+        env.execute.assert_not_called()
 
     def test_read_file_never_persisted(self):
         """read_file has threshold=inf, should never be persisted."""
@@ -377,23 +390,11 @@ class TestMaybePersistToolResult:
         )
         assert result == content
 
-    def test_file_path_uses_tool_use_id(self):
+    def test_tool_use_id_is_recorded_in_provenance_not_used_as_path(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
-        content = "x" * 60_000
-        result = maybe_persist_tool_result(
-            content=content,
-            tool_name="terminal",
-            tool_use_id="unique_id_abc",
-            env=env,
-            threshold=30_000,
-        )
-        assert "unique_id_abc.txt" in result
-
-    def test_tool_use_id_cannot_escape_storage_dir(self):
-        env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
-        env.get_temp_dir.return_value = ""
         content = "x" * 60_000
         result = maybe_persist_tool_result(
             content=content,
@@ -402,15 +403,14 @@ class TestMaybePersistToolResult:
             env=env,
             threshold=30_000,
         )
-        cmd = env.execute.call_args[0][0]
-        target = cmd.split("cat > ", 1)[1].split(" <<", 1)[0]
-
-        assert "Full output saved to: /tmp/hermes-results/outside_whoami_x_" in result
-        assert "/tmp/hermes-results/../" not in result
-        assert target.startswith("/tmp/hermes-results/outside_whoami_x_")
-        assert "/../" not in target
-        assert "$(whoami)" not in target
-        assert ";" not in target
+        references = list((tmp_path / "profile" / "artifacts" / "references").glob("*.json"))
+        assert len(references) == 1
+        payload = json.loads(references[0].read_text(encoding="utf-8"))
+        assert payload["tool_call_id"] == "../outside/$(whoami);x"
+        assert references[0].parent == tmp_path / "profile" / "artifacts" / "references"
+        assert "artifact_get" in result
+        assert "outside" not in result
+        env.execute.assert_not_called()
 
     def test_preview_included_in_persisted_output(self):
         env = MagicMock()
@@ -426,9 +426,8 @@ class TestMaybePersistToolResult:
         )
         assert "DISTINCTIVE_START_MARKER" in result
 
-    def test_env_temp_dir_changes_persisted_path(self):
+    def test_env_temp_dir_does_not_create_unbounded_backend_copy(self):
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
         env.get_temp_dir.return_value = "/data/data/com.termux/files/usr/tmp"
         content = "x" * 60_000
         result = maybe_persist_tool_result(
@@ -438,9 +437,9 @@ class TestMaybePersistToolResult:
             env=env,
             threshold=30_000,
         )
-        assert "/data/data/com.termux/files/usr/tmp/hermes-results/tc_termux.txt" in result
-        cmd = env.execute.call_args[0][0]
-        assert "mkdir -p /data/data/com.termux/files/usr/tmp/hermes-results" in cmd
+        assert "artifact_get" in result
+        assert "/data/data/com.termux" not in result
+        env.execute.assert_not_called()
 
     def test_threshold_zero_forces_persist(self):
         env = MagicMock()
@@ -518,6 +517,25 @@ class TestEnforceTurnBudget:
         enforce_turn_budget(msgs, env=None, config=BudgetConfig(turn_budget=200_000))
         # Should be truncated (no sandbox available)
         assert "Truncated" in msgs[0]["content"] or PERSISTED_OUTPUT_TAG in msgs[0]["content"]
+
+    def test_aggregate_persistence_records_session_lineage(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+        msgs = [
+            {"role": "tool", "tool_call_id": "lineage-call", "content": "x" * 250_000},
+        ]
+
+        enforce_turn_budget(
+            msgs,
+            env=None,
+            config=BudgetConfig(turn_budget=200_000),
+            session_id="lineage-session",
+        )
+
+        references = list((tmp_path / "profile" / "artifacts" / "references").glob("*.json"))
+        assert len(references) == 1
+        reference = json.loads(Path(references[0]).read_text(encoding="utf-8"))
+        assert reference["session_id"] == "lineage-session"
+        assert reference["tool_call_id"] == "lineage-call"
 
     def test_returns_same_list(self):
         msgs = [{"role": "tool", "tool_call_id": "t1", "content": "ok"}]
