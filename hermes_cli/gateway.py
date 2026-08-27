@@ -953,15 +953,7 @@ def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
         text = unit_path.read_text(encoding="utf-8")
     except OSError:
         return None
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("Environment="):
-            continue
-        body = stripped[len("Environment=") :].strip().strip('"')
-        if body.startswith("HERMES_HOME="):
-            value = body.split("=", 1)[1].strip().strip('"')
-            return value or None
-    return None
+    return _hermes_home_in_service_definition(text)
 
 
 def _sync_hermes_home_from_systemd_unit(system: bool) -> None:
@@ -2892,6 +2884,27 @@ def systemd_unit_is_current(system: bool = False) -> bool:
     return norm_installed == norm_expected
 
 
+def _hermes_home_in_service_definition(definition: str) -> str | None:
+    """Parse HERMES_HOME from active systemd ``Environment=`` assignments."""
+    import shlex
+
+    for line in definition.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("Environment="):
+            continue
+        body = stripped[len("Environment=") :].strip()
+        try:
+            assignments = shlex.split(body, posix=True)
+        except ValueError:
+            continue
+        for assignment in assignments:
+            if not assignment.startswith("HERMES_HOME="):
+                continue
+            value = assignment.split("=", 1)[1].strip()
+            return value or None
+    return None
+
+
 def _temp_home_in_service_definition(definition: str) -> str | None:
     """Return the temp-dir HERMES_HOME baked into a service definition, or None.
 
@@ -2956,6 +2969,26 @@ def refresh_systemd_unit_if_needed(system: bool = False) -> bool:
     unit_path = get_systemd_unit_path(system=system)
     if not unit_path.exists():
         return False
+
+    if not system:
+        installed_definition = unit_path.read_text(encoding="utf-8")
+        installed_home = _hermes_home_in_service_definition(installed_definition)
+        current_home = get_hermes_home()
+        if installed_home:
+            try:
+                homes_differ = Path(installed_home).resolve() != Path(current_home).resolve()
+            except (OSError, ValueError):
+                homes_differ = installed_home != current_home
+            if homes_differ:
+                print(
+                    "✗ Refusing to repin the installed user gateway service from "
+                    f"{installed_home} to {current_home}."
+                )
+                print(
+                    "  Run the alternate gateway without service refresh, or explicitly "
+                    "reinstall the service when changing its canonical profile."
+                )
+                return False
 
     # The gate below funnels through ``systemd_unit_is_current``, which is the
     # single HERMES_HOME-sync chokepoint (adopts the unit's pinned home before

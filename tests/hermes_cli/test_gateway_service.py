@@ -343,6 +343,133 @@ class TestSystemdServiceRefresh:
             "daemon-reload" in str(c) for c in ran
         ), "daemon-reload must not run when write was refused"
 
+    def test_refresh_refuses_to_repin_user_unit_to_different_non_temp_home(
+        self, tmp_path, monkeypatch
+    ):
+        """A parallel pilot home must not replace the installed live home."""
+        unit_path = tmp_path / "hermes-gateway.service"
+        installed = (
+            "[Service]\n"
+            'Environment="HERMES_HOME=/root/.hermes"\n'
+            "WorkingDirectory=/root\n"
+        )
+        generated = (
+            "[Service]\n"
+            'Environment="HERMES_HOME=/root/.hermes-bounded-pilot"\n'
+            "WorkingDirectory=/root/.hermes-bounded-pilot\n"
+        )
+        unit_path.write_text(installed, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", "/root/.hermes-bounded-pilot")
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: generated,
+        )
+        ran = []
+
+        def fake_run(cmd, check=True, **kwargs):
+            ran.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        result = gateway_cli.refresh_systemd_unit_if_needed(system=False)
+
+        assert result is False
+        assert unit_path.read_text(encoding="utf-8") == installed
+        assert not any("daemon-reload" in str(c) for c in ran)
+
+    def test_refresh_ignores_commented_home_that_matches_alternate_process(
+        self, tmp_path, monkeypatch
+    ):
+        unit_path = tmp_path / "hermes-gateway.service"
+        installed = (
+            "[Service]\n"
+            "# HERMES_HOME=/root/.hermes-bounded-pilot\n"
+            'Environment="HERMES_HOME=/root/.hermes"\n'
+            "WorkingDirectory=/root\n"
+        )
+        generated = (
+            "[Service]\n"
+            'Environment="HERMES_HOME=/root/.hermes-bounded-pilot"\n'
+            "WorkingDirectory=/root/.hermes-bounded-pilot\n"
+        )
+        unit_path.write_text(installed, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", "/root/.hermes-bounded-pilot")
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: generated,
+        )
+        ran = []
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, check=True, **kwargs: ran.append(cmd)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        result = gateway_cli.refresh_systemd_unit_if_needed(system=False)
+
+        assert result is False
+        assert unit_path.read_text(encoding="utf-8") == installed
+        assert not any("daemon-reload" in str(c) for c in ran)
+
+    def test_refresh_ignores_commented_old_home_for_legitimate_same_home_update(
+        self, tmp_path, monkeypatch
+    ):
+        unit_path = tmp_path / "hermes-gateway.service"
+        installed = (
+            "[Service]\n"
+            "# HERMES_HOME=/root/.hermes-old\n"
+            'Environment="HERMES_HOME=/root/.hermes-bounded-pilot"\n'
+            "WorkingDirectory=/old\n"
+        )
+        generated = (
+            "[Service]\n"
+            'Environment="HERMES_HOME=/root/.hermes-bounded-pilot"\n'
+            "WorkingDirectory=/root/.hermes-bounded-pilot\n"
+        )
+        unit_path.write_text(installed, encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", "/root/.hermes-bounded-pilot")
+        monkeypatch.setattr(
+            gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_systemd_unit",
+            lambda system=False, run_as_user=None: generated,
+        )
+        ran = []
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, check=True, **kwargs: ran.append(cmd)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+
+        result = gateway_cli.refresh_systemd_unit_if_needed(system=False)
+
+        assert result is True
+        assert unit_path.read_text(encoding="utf-8") == generated
+        assert any("daemon-reload" in str(c) for c in ran)
+
+    def test_systemd_definition_parser_handles_unquoted_multiple_assignments(self):
+        definition = (
+            "[Service]\n"
+            "Environment=HERMES_HOME=/root/.hermes FOO=bar\n"
+        )
+        assert (
+            gateway_cli._hermes_home_in_service_definition(definition)
+            == "/root/.hermes"
+        )
+
 
 class TestTempHomeServiceDefinitionGuard:
     """_temp_home_in_service_definition() — structural temp-dir detection."""
