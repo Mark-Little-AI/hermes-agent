@@ -31,6 +31,11 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.episode_controller import (
+    EpisodeAction,
+    apply_episode_boundary,
+    episode_controller_from_config,
+)
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import build_turn_context
 from agent.turn_retry_state import TurnRetryState
@@ -72,6 +77,28 @@ from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _episode_controller_for_turn(agent, config=None):
+    """Create an opt-in bounded-episode controller for a durable turn."""
+    if getattr(agent, "_session_db", None) is None or not getattr(
+        agent, "session_id", None
+    ):
+        return None
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = (load_config().get("bounded_episodes", {}) or {})
+        except Exception as exc:
+            logger.warning("Could not load bounded episode config: %s", exc)
+            return None
+    try:
+        return episode_controller_from_config(config)
+    except (TypeError, ValueError) as exc:
+        logger.warning("Invalid bounded episode config; feature disabled: %s", exc)
+        return None
+
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -640,7 +667,136 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    episode_controller = _episode_controller_for_turn(agent)
+    episode_objective = (
+        original_user_message
+        if isinstance(original_user_message, str)
+        else user_message
+    )
+    _pending_episode_rollover = False
+    _episode_stop_persistence_failed = False
+
+    class _BoundedEpisodeTaskLimit(Exception):
+        pass
+
+    def _record_bounded_api_attempt() -> EpisodeAction:
+        nonlocal episode_controller, _pending_episode_rollover
+        nonlocal _episode_stop_persistence_failed
+        if episode_controller is None:
+            return EpisodeAction.CONTINUE
+        action = episode_controller.record_iteration()
+        if action is EpisodeAction.ROLLOVER:
+            # A retry/fallback request reuses a request payload already built
+            # for this logical loop iteration. Defer context replacement until
+            # the next successful tool result is available; failed attempts do
+            # not add transcript weight.
+            _pending_episode_rollover = True
+            return action
+        if action not in {EpisodeAction.CHECKPOINT, EpisodeAction.STOP}:
+            return action
+        try:
+            apply_episode_boundary(
+                agent=agent,
+                controller=episode_controller,
+                action=action,
+                objective=episode_objective,
+                task_id=effective_task_id,
+                messages=messages,
+            )
+        except Exception as exc:
+            if action is EpisodeAction.STOP:
+                _episode_stop_persistence_failed = True
+                logger.error(
+                    "Bounded task safety limit reached but final checkpoint "
+                    "persistence failed; stopping with active context retained: %s",
+                    exc,
+                )
+                agent._emit_status(
+                    "⚠️ Bounded task safety limit reached; stopping even though "
+                    "the final checkpoint could not be persisted"
+                )
+                return EpisodeAction.STOP
+            logger.warning(
+                "Bounded episode checkpoint failed; disabling for this turn "
+                "without discarding context: %s",
+                exc,
+            )
+            agent._emit_status(
+                "⚠️ Bounded episode checkpoint failed; continuing with the "
+                "existing context"
+            )
+            episode_controller = None
+            return EpisodeAction.CONTINUE
+        return action
+
+    def _apply_pending_episode_rollover() -> bool | dict[str, Any]:
+        nonlocal episode_controller, _pending_episode_rollover
+        nonlocal messages, conversation_history
+        nonlocal truncated_response_parts, length_continue_retries
+        nonlocal truncated_tool_call_retries, codex_ack_continuations
+        if not _pending_episode_rollover or episode_controller is None:
+            return False
+        try:
+            episode_messages = apply_episode_boundary(
+                agent=agent,
+                controller=episode_controller,
+                action=EpisodeAction.ROLLOVER,
+                objective=episode_objective,
+                task_id=effective_task_id,
+                messages=messages,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Bounded episode rollover failed; disabling for this turn "
+                "without discarding context: %s",
+                exc,
+            )
+            agent._emit_status(
+                "⚠️ Bounded episode rollover failed; automatic continuation "
+                "stopped with the existing context retained"
+            )
+            episode_controller = None
+            _pending_episode_rollover = False
+            failure_response = (
+                "Automatic continuation stopped because the bounded episode "
+                "checkpoint could not be persisted safely. The existing context "
+                "was retained."
+            )
+            messages.append({"role": "assistant", "content": failure_response})
+            try:
+                agent._persist_session(messages, conversation_history)
+            except Exception as persist_exc:
+                logger.error(
+                    "Could not persist rollover failure response: %s", persist_exc
+                )
+            return {
+                "final_response": failure_response,
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "failed": True,
+                "error": "bounded_episode_rollover_failed",
+            }
+        messages = episode_messages
+        conversation_history = None
+        agent._last_flushed_db_idx = 0
+        agent._session_messages = messages
+        truncated_response_parts = []
+        length_continue_retries = 0
+        truncated_tool_call_retries = 0
+        codex_ack_continuations = 0
+        agent._ephemeral_max_output_tokens = None
+        _pending_episode_rollover = False
+        return True
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        # Universal boundary guard: no new outer-loop provider request may start
+        # with a pending rollover, regardless of which recovery path changed
+        # or rebuilt the transcript on the previous attempt.
+        _rollover_result = _apply_pending_episode_rollover()
+        if isinstance(_rollover_result, dict):
+            return _rollover_result
+
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         agent._checkpoint_mgr.new_turn()
 
@@ -1318,36 +1474,74 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
-                    if agent.api_mode == "codex_responses":
-                        next_api_kwargs = agent._get_transport().preflight_kwargs(
-                            next_api_kwargs,
-                            allow_stream=False,
-                            is_github_responses=agent._is_copilot_url(),
-                        )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    try:
+                        if agent.api_mode == "codex_responses":
+                            next_api_kwargs = agent._get_transport().preflight_kwargs(
+                                next_api_kwargs,
+                                allow_stream=False,
+                                is_github_responses=agent._is_copilot_url(),
+                            )
+                        if _use_streaming:
+                            return agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        return agent._interruptible_api_call(next_api_kwargs)
+                    finally:
+                        if _record_bounded_api_attempt() is EpisodeAction.STOP:
+                            raise _BoundedEpisodeTaskLimit
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
-                response = run_llm_execution_middleware(
-                    api_kwargs,
-                    _perform_api_call,
-                    original_request=_original_api_kwargs,
-                    task_id=effective_task_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    session_id=agent.session_id or "",
-                    platform=agent.platform or "",
-                    model=agent.model,
-                    provider=agent.provider,
-                    base_url=agent.base_url,
-                    api_mode=agent.api_mode,
-                    api_call_count=api_call_count,
-                    middleware_trace=list(_llm_middleware_trace),
-                )
+                try:
+                    response = run_llm_execution_middleware(
+                        api_kwargs,
+                        _perform_api_call,
+                        original_request=_original_api_kwargs,
+                        task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        session_id=agent.session_id or "",
+                        platform=agent.platform or "",
+                        model=agent.model,
+                        provider=agent.provider,
+                        base_url=agent.base_url,
+                        api_mode=agent.api_mode,
+                        api_call_count=api_call_count,
+                        middleware_trace=list(_llm_middleware_trace),
+                    )
+                except _BoundedEpisodeTaskLimit:
+                    _turn_exit_reason = "bounded_episode_task_limit"
+                    if _episode_stop_persistence_failed:
+                        final_response = (
+                            "Task stopped at its bounded execution safety limit. "
+                            "The active context was retained, but the final "
+                            "checkpoint could not be persisted."
+                        )
+                    else:
+                        final_response = (
+                            "Task stopped at its bounded execution safety limit. "
+                            "Progress remains in the session transcript and latest "
+                            "task checkpoint."
+                        )
+                    messages.append({"role": "assistant", "content": final_response})
+                    agent._emit_status(
+                        "⚠️ Bounded task safety limit reached; automatic "
+                        "continuation stopped"
+                    )
+                    try:
+                        agent._persist_session(messages, conversation_history)
+                    except Exception as exc:
+                        logger.error(
+                            "Could not persist bounded-limit stop response: %s", exc
+                        )
+                    return {
+                        "final_response": final_response,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": "bounded_episode_task_limit",
+                    }
                 
                 api_duration = time.time() - api_start_time
                 
@@ -4428,6 +4622,9 @@ def run_conversation(
                     if not agent.quiet_mode:
                         agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
                     agent._session_messages = messages
+                    _rollover_result = _apply_pending_episode_rollover()
+                    if isinstance(_rollover_result, dict):
+                        return _rollover_result
                     continue
 
                 agent._codex_incomplete_retries = 0
@@ -4524,6 +4721,9 @@ def run_conversation(
                             "tool_call_id": tc.id,
                             "content": content,
                         })
+                    _rollover_result = _apply_pending_episode_rollover()
+                    if isinstance(_rollover_result, dict):
+                        return _rollover_result
                     continue
                 # Reset retry counter on successful tool call validation
                 agent._invalid_tool_retries = 0
@@ -4616,6 +4816,9 @@ def run_conversation(
                                 "tool_call_id": tc.id,
                                 "content": tool_result,
                             })
+                        _rollover_result = _apply_pending_episode_rollover()
+                        if isinstance(_rollover_result, dict):
+                            return _rollover_result
                         continue
                 
                 # Reset retry counter on successful JSON validation
@@ -4756,6 +4959,12 @@ def run_conversation(
                 _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
+
+                _rollover_result = _apply_pending_episode_rollover()
+                if isinstance(_rollover_result, dict):
+                    return _rollover_result
+                if _rollover_result:
+                    continue
                 
                 # Use real token counts from the API response to decide
                 # compression.  prompt_tokens + completion_tokens is the
@@ -4942,6 +5151,9 @@ def run_conversation(
                             ),
                             "_empty_recovery_synthetic": True,
                         })
+                        _rollover_result = _apply_pending_episode_rollover()
+                        if isinstance(_rollover_result, dict):
+                            return _rollover_result
                         continue
 
                     # ── Thinking-only prefill continuation ──────────
@@ -4976,6 +5188,9 @@ def run_conversation(
                         interim_msg["_thinking_prefill"] = True
                         messages.append(interim_msg)
                         agent._session_messages = messages
+                        _rollover_result = _apply_pending_episode_rollover()
+                        if isinstance(_rollover_result, dict):
+                            return _rollover_result
                         continue
 
                     # ── Empty response retry ──────────────────────
@@ -5130,6 +5345,9 @@ def run_conversation(
                     # text suppress iteration-limit summarization if this
                     # continuation consumes the remaining budget.
                     final_response = None
+                    _rollover_result = _apply_pending_episode_rollover()
+                    if isinstance(_rollover_result, dict):
+                        return _rollover_result
                     continue
 
                 codex_ack_continuations = 0
@@ -5210,6 +5428,9 @@ def run_conversation(
                     # from unrelated error/recovery exits. (#61631)
                     _pending_verification_response = final_response
                     final_response = None
+                    _rollover_result = _apply_pending_episode_rollover()
+                    if isinstance(_rollover_result, dict):
+                        return _rollover_result
                     continue
 
                 # User verification-loop gate: when the agent edited code this
@@ -5263,6 +5484,9 @@ def run_conversation(
                                  agent._pre_verify_nudges)
                     _pending_verification_response = final_response
                     final_response = None
+                    _rollover_result = _apply_pending_episode_rollover()
+                    if isinstance(_rollover_result, dict):
+                        return _rollover_result
                     continue
 
                 messages.append(final_msg)
@@ -5313,6 +5537,12 @@ def run_conversation(
                             }
                             messages.append(err_msg)
                 break
+
+            _rollover_result = _apply_pending_episode_rollover()
+            if isinstance(_rollover_result, dict):
+                return _rollover_result
+            if _rollover_result:
+                continue
             
             # Non-tool errors don't need a synthetic message injected.
             # The error is already printed to the user (line above), and

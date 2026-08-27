@@ -1409,6 +1409,16 @@ DEFAULT_CONFIG = {
         },
     },
 
+    "bounded_episodes": {
+        # Opt-in until isolated gateway tests and a controlled pilot pass.
+        "enabled": False,
+        "checkpoint_interval": 20,
+        "rollover_interval": 40,
+        "max_episodes": 5,
+        "max_total_iterations": 200,
+        "max_wall_seconds": 7200,
+    },
+
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio.

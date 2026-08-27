@@ -807,6 +807,17 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode)
 );
 
+CREATE TABLE IF NOT EXISTS task_checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL,
+    checkpoint_json TEXT NOT NULL,
+    episode_number INTEGER NOT NULL,
+    episode_iterations INTEGER NOT NULL,
+    total_iterations INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -835,6 +846,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_task_checkpoints_latest
+    ON task_checkpoints(session_id, task_id, id DESC);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -1676,6 +1689,66 @@ class SessionDB:
                     )
 
         self._conn.commit()
+
+    # =========================================================================
+    # Structured task checkpoints
+    # =========================================================================
+
+    def save_task_checkpoint(
+        self,
+        session_id: str,
+        task_id: str,
+        checkpoint: Dict[str, Any],
+    ) -> int:
+        """Append structured continuation state and return its row ID."""
+        from agent.task_checkpoint import validate_checkpoint_payload
+
+        checkpoint = validate_checkpoint_payload(checkpoint)
+        checkpoint_json = json.dumps(
+            checkpoint,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO task_checkpoints (
+                    session_id, task_id, checkpoint_json, episode_number,
+                    episode_iterations, total_iterations, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    task_id,
+                    checkpoint_json,
+                    int(checkpoint.get("episode_number", 1)),
+                    int(checkpoint.get("episode_iterations", 0)),
+                    int(checkpoint.get("total_iterations", 0)),
+                    time.time(),
+                ),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    def load_latest_task_checkpoint(
+        self,
+        session_id: str,
+        task_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return the latest structured checkpoint for a session task."""
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT checkpoint_json
+                   FROM task_checkpoints
+                   WHERE session_id = ? AND task_id = ?
+                   ORDER BY id DESC
+                   LIMIT 1""",
+                (session_id, task_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["checkpoint_json"])
 
     # =========================================================================
     # Session lifecycle

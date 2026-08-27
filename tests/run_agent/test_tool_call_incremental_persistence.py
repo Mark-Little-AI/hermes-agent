@@ -142,6 +142,423 @@ def test_run_conversation_flushes_assistant_tool_call_before_execution():
     assert result["final_response"] == "done"
 
 
+def test_run_conversation_rolls_over_to_structured_checkpoint_context():
+    agent = _make_agent()
+    first_call = _mock_tool_call(call_id="c1")
+    second_call = _mock_tool_call(call_id="c2")
+    third_call = _mock_tool_call(call_id="c3")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[first_call]),
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[second_call]),
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[third_call]),
+        _mock_response(content="done", finish_reason="stop"),
+    ]
+
+    class CheckpointDB:
+        def __init__(self):
+            self.saved = []
+
+        def save_task_checkpoint(self, session_id, task_id, checkpoint):
+            self.saved.append((session_id, task_id, checkpoint))
+
+    checkpoint_db = CheckpointDB()
+    agent._session_db = checkpoint_db
+
+    def _fake_execute(assistant_message, messages, effective_task_id, api_call_count=0):
+        call = assistant_message.tool_calls[0]
+        messages.append(
+            make_tool_result_message(
+                "web_search", f"raw-result-{call.id}", call.id
+            )
+        )
+
+    episode_config = {
+        "bounded_episodes": {
+            "enabled": True,
+            "checkpoint_interval": 2,
+            "rollover_interval": 3,
+            "max_episodes": 3,
+            "max_total_iterations": 6,
+            "max_wall_seconds": 600,
+        }
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=episode_config),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_flush_messages_to_session_db"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute),
+    ):
+        result = agent.run_conversation("perform three searches")
+
+    assert result["final_response"] == "done"
+    assert len(checkpoint_db.saved) == 2
+    assert [entry[2]["total_iterations"] for entry in checkpoint_db.saved] == [2, 3]
+    assert all(entry[0] == checkpoint_db.saved[0][0] for entry in checkpoint_db.saved)
+    fourth_request = str(agent.client.chat.completions.create.call_args_list[3])
+    assert "BOUNDED EPISODE CONTINUATION" in fourth_request
+    assert "Artifact ID" in fourth_request
+    assert "raw-result-c1" not in fourth_request
+    assert "raw-result-c2" not in fourth_request
+    assert "raw-result-c3" not in fourth_request
+
+
+def test_rollover_applies_before_retry_after_invalid_tool_transcript():
+    agent = _make_agent()
+    invalid_one = _mock_tool_call(
+        name="nonexistent_tool", call_id="bad1", arguments='{"secret_argument":"one"}'
+    )
+    invalid_two = _mock_tool_call(
+        name="nonexistent_tool", call_id="bad2", arguments='{"secret_argument":"two"}'
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[invalid_one]),
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[invalid_two]),
+        _mock_response(content="recovered", finish_reason="stop"),
+    ]
+
+    class CheckpointDB:
+        def __init__(self):
+            self.saved = []
+
+        def save_task_checkpoint(self, session_id, task_id, checkpoint):
+            self.saved.append((session_id, task_id, checkpoint))
+            return len(self.saved)
+
+    agent._session_db = CheckpointDB()
+    episode_config = {
+        "bounded_episodes": {
+            "enabled": True,
+            "checkpoint_interval": 1,
+            "rollover_interval": 2,
+            "max_episodes": 3,
+            "max_total_iterations": 5,
+            "max_wall_seconds": 600,
+        }
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=episode_config),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_flush_messages_to_session_db"),
+    ):
+        result = agent.run_conversation("recover from invalid tools")
+
+    assert result["final_response"] == "recovered"
+    assert agent.client.chat.completions.create.call_count == 3
+    third_request = str(agent.client.chat.completions.create.call_args_list[2])
+    assert "BOUNDED EPISODE CONTINUATION" in third_request
+    assert "Artifact ID" in third_request
+    assert "secret_argument" not in third_request
+
+
+def test_rollover_applies_before_retry_after_invalid_json_recovery_transcript():
+    agent = _make_agent()
+    broken_calls = [
+        _mock_tool_call(name="web_search", call_id=f"json{index}", arguments="{]")
+        for index in range(1, 4)
+    ]
+    agent.client.chat.completions.create.side_effect = [
+        *[
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[call])
+            for call in broken_calls
+        ],
+        _mock_response(content="recovered", finish_reason="stop"),
+    ]
+
+    class CheckpointDB:
+        def __init__(self):
+            self.saved = []
+
+        def save_task_checkpoint(self, session_id, task_id, checkpoint):
+            self.saved.append((session_id, task_id, checkpoint))
+            return len(self.saved)
+
+    agent._session_db = CheckpointDB()
+    episode_config = {
+        "bounded_episodes": {
+            "enabled": True,
+            "checkpoint_interval": 1,
+            "rollover_interval": 3,
+            "max_episodes": 3,
+            "max_total_iterations": 6,
+            "max_wall_seconds": 600,
+        }
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=episode_config),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_flush_messages_to_session_db"),
+    ):
+        result = agent.run_conversation("recover from malformed tool arguments")
+
+    assert result["final_response"] == "recovered"
+    assert agent.client.chat.completions.create.call_count == 4
+    fourth_request = str(agent.client.chat.completions.create.call_args_list[3])
+    assert "BOUNDED EPISODE CONTINUATION" in fourth_request
+    assert "Artifact ID" in fourth_request
+    assert "{]" not in fourth_request
+
+
+def test_rollover_applies_after_tool_execution_exception_before_retry():
+    agent = _make_agent()
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(call_id="ok1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(
+                    call_id="boom2", arguments='{"sentinel":"must-not-cross"}'
+                )
+            ],
+        ),
+        _mock_response(content="recovered", finish_reason="stop"),
+    ]
+
+    class CheckpointDB:
+        def __init__(self):
+            self.saved = []
+
+        def save_task_checkpoint(self, session_id, task_id, checkpoint):
+            self.saved.append((session_id, task_id, checkpoint))
+            return len(self.saved)
+
+    agent._session_db = CheckpointDB()
+
+    def _execute(assistant_message, messages, effective_task_id, api_call_count):
+        call = assistant_message.tool_calls[0]
+        if api_call_count == 2:
+            raise RuntimeError("tool exploded")
+        messages.append(make_tool_result_message("web_search", "raw result", call.id))
+
+    episode_config = {
+        "bounded_episodes": {
+            "enabled": True,
+            "checkpoint_interval": 1,
+            "rollover_interval": 2,
+            "max_episodes": 3,
+            "max_total_iterations": 5,
+            "max_wall_seconds": 600,
+        }
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=episode_config),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_flush_messages_to_session_db"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_execute),
+    ):
+        result = agent.run_conversation("recover after tool execution failure")
+
+    assert result["final_response"] == "recovered"
+    assert agent.client.chat.completions.create.call_count == 3
+    third_request = str(agent.client.chat.completions.create.call_args_list[2])
+    assert "BOUNDED EPISODE CONTINUATION" in third_request
+    assert "Artifact ID" in third_request
+    assert "must-not-cross" not in third_request
+    assert "tool exploded" not in third_request
+
+
+def test_outer_loop_guard_rolls_over_before_length_continuation_request():
+    agent = _make_agent()
+    partial = "bounded partial " + ("x" * 5_000) + "tail-must-not-cross"
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(call_id="seed1")],
+        ),
+        _mock_response(content=partial, finish_reason="length"),
+        _mock_response(content="recovered", finish_reason="stop"),
+    ]
+
+    class CheckpointDB:
+        def __init__(self):
+            self.saved = []
+
+        def save_task_checkpoint(self, session_id, task_id, checkpoint):
+            self.saved.append((session_id, task_id, checkpoint))
+            return len(self.saved)
+
+    agent._session_db = CheckpointDB()
+
+    def _execute(assistant_message, messages, effective_task_id, api_call_count):
+        call = assistant_message.tool_calls[0]
+        messages.append(make_tool_result_message("web_search", "seed result", call.id))
+
+    episode_config = {
+        "bounded_episodes": {
+            "enabled": True,
+            "checkpoint_interval": 1,
+            "rollover_interval": 2,
+            "max_episodes": 3,
+            "max_total_iterations": 5,
+            "max_wall_seconds": 600,
+        }
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=episode_config),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_flush_messages_to_session_db"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_execute),
+    ):
+        result = agent.run_conversation("recover after truncated output")
+
+    assert result["final_response"] == "recovered"
+    assert agent.client.chat.completions.create.call_count == 3
+    third_request = str(agent.client.chat.completions.create.call_args_list[2])
+    assert "BOUNDED EPISODE CONTINUATION" in third_request
+    assert "tail-must-not-cross" not in third_request
+    assert "finish_reason': 'length'" not in third_request
+
+
+def test_bounded_episode_counts_retry_and_fallback_provider_attempts(monkeypatch):
+    agent = _make_agent()
+    agent.client.chat.completions.create.side_effect = [
+        SimpleNamespace(choices=[]),
+        _mock_response(content="would otherwise succeed", finish_reason="stop"),
+    ]
+
+    class CheckpointDB:
+        def __init__(self):
+            self.saved = []
+
+        def save_task_checkpoint(self, session_id, task_id, checkpoint):
+            self.saved.append((session_id, task_id, checkpoint))
+            return len(self.saved)
+
+    checkpoint_db = CheckpointDB()
+    agent._session_db = checkpoint_db
+    episode_config = {
+        "bounded_episodes": {
+            "enabled": True,
+            "checkpoint_interval": 1,
+            "rollover_interval": 3,
+            "max_episodes": 3,
+            "max_total_iterations": 2,
+            "max_wall_seconds": 600,
+        }
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=episode_config),
+        patch("agent.conversation_loop.jittered_backoff", return_value=0),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_flush_messages_to_session_db"),
+    ):
+        result = agent.run_conversation("exercise provider retry accounting")
+
+    assert result["error"] == "bounded_episode_task_limit"
+    assert agent.client.chat.completions.create.call_count == 2
+    assert [entry[2]["total_iterations"] for entry in checkpoint_db.saved] == [1, 2]
+
+
+def test_bounded_episode_stop_fails_closed_when_checkpoint_persistence_fails():
+    agent = _make_agent()
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="discarded at safety limit", finish_reason="stop"),
+        _mock_response(content="must never run", finish_reason="stop"),
+    ]
+
+    class FailingCheckpointDB:
+        def save_task_checkpoint(self, session_id, task_id, checkpoint):
+            raise OSError("checkpoint storage unavailable")
+
+    agent._session_db = FailingCheckpointDB()
+    episode_config = {
+        "bounded_episodes": {
+            "enabled": True,
+            "checkpoint_interval": 1,
+            "rollover_interval": 3,
+            "max_episodes": 3,
+            "max_total_iterations": 1,
+            "max_wall_seconds": 600,
+        }
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=episode_config),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_flush_messages_to_session_db"),
+    ):
+        result = agent.run_conversation("stop safely if checkpointing fails")
+
+    assert result["error"] == "bounded_episode_task_limit"
+    assert "could not be persisted" in result["final_response"]
+    assert agent.client.chat.completions.create.call_count == 1
+
+
+def test_bounded_episode_rollover_fails_closed_when_checkpoint_persistence_fails():
+    agent = _make_agent()
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(call_id="c1")],
+        ),
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(call_id="c2")],
+        ),
+        _mock_response(content="must never run", finish_reason="stop"),
+    ]
+
+    class FailingRolloverDB:
+        def __init__(self):
+            self.calls = 0
+
+        def save_task_checkpoint(self, session_id, task_id, checkpoint):
+            self.calls += 1
+            if self.calls >= 2:
+                raise OSError("rollover checkpoint unavailable")
+            return self.calls
+
+    agent._session_db = FailingRolloverDB()
+
+    def _fake_execute(assistant_message, messages, effective_task_id, api_call_count):
+        call = assistant_message.tool_calls[0]
+        messages.append(make_tool_result_message("web_search", "raw result", call.id))
+
+    episode_config = {
+        "bounded_episodes": {
+            "enabled": True,
+            "checkpoint_interval": 1,
+            "rollover_interval": 2,
+            "max_episodes": 3,
+            "max_total_iterations": 5,
+            "max_wall_seconds": 600,
+        }
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=episode_config),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_flush_messages_to_session_db"),
+        patch.object(agent, "_execute_tool_calls", side_effect=_fake_execute),
+    ):
+        result = agent.run_conversation("stop safely if rollover cannot persist")
+
+    assert result["error"] == "bounded_episode_rollover_failed"
+    assert "existing context was retained" in result["final_response"]
+    assert agent.client.chat.completions.create.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # Contract 2: the SEQUENTIAL path flushes each tool result immediately, BEFORE
 # the next tool dispatches.  Dispatch goes through run_agent.handle_function_call
